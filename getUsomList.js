@@ -10,7 +10,7 @@ const OUTPUT_FILE = path.join(__dirname, "domains.txt");
 const CACHE_FILE = path.join(__dirname, "cache.json");
 
 const ENABLE_UMBRELLA = true;
-const UMBRELLA_URL = "https://s-platform.api.opendns.com/1.0/events?customerKey=cbbd223a-e594-4b78-8462-52845de9cb6f";
+const UMBRELLA_URL = "https://s-platform.api.opendns.com/1.0/events?customerKey=YOUR-KEY";
 
 const PAGE_SIZE = 9999;
 const TOTAL_PAGES = 46;
