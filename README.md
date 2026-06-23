@@ -15,4 +15,4 @@ Bu proje, [Sibergüvenlik](https://siberguvenlik.gov.tr/) API'sinden tehdit isti
 - [Node.js](https://nodejs.org/) (v16 veya üzeri)
 - Gerekli paketlerin kurulumu:
   ```bash
-  npm install axios
+  npm install axios dotenv
