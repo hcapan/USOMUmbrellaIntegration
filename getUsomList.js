@@ -1,19 +1,49 @@
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+require("dotenv").config();
+
+// ================= ENV =================
+const umbrellaKey = process.env.UMBRELLA_KEY;
+
+// ================= FILE OPS =================
+function saveDomains(domains) {
+  // Set kullanarak benzersiz domainleri al
+  const uniqueDomains = [...new Set(domains)];
+
+  try {
+    fs.writeFileSync(OUTPUT_FILE, uniqueDomains.join("\n"), "utf8");
+    console.log(
+      `\n${uniqueDomains.length} unique domain saved to ${OUTPUT_FILE}`,
+    );
+  } catch (err) {
+    console.error("Failed to save domains file:", err);
+  }
+}
+
+function loadDomains() {
+  if (!fs.existsSync(OUTPUT_FILE)) return [];
+  const data = fs.readFileSync(OUTPUT_FILE, "utf-8");
+  return data.split(/\r?\n/).filter((line) => line.trim() !== "");
+}
 
 // ================= CONFIG =================
 // Using path.join(__dirname) ensures files are always found in the script's directory
 const BASE_URL = "https://siberguvenlik.gov.tr/api/address/index";
 const STATE_FILE = path.join(__dirname, "state.json");
 const OUTPUT_FILE = path.join(__dirname, "domains.txt");
-const CACHE_FILE = path.join(__dirname, "cache.json");
 
 const ENABLE_UMBRELLA = true;
-const UMBRELLA_URL = "https://s-platform.api.opendns.com/1.0/events?customerKey=YOUR-KEY";
+const UMBRELLA_URL = `https://s-platform.api.opendns.com/1.0/events?customerKey=${umbrellaKey}`;
+
+if (ENABLE_UMBRELLA && !umbrellaKey) {
+  console.error(
+    "Error: ENABLE_UMBRELLA is true, but UMBRELLA_KEY is missing in your .env file!",
+  );
+  process.exit(1);
+}
 
 const PAGE_SIZE = 9999;
-const TOTAL_PAGES = 46;
 const BATCH_SIZE = 200;
 
 // ================= UMBRELLA RATE LIMIT CONFIG =================
@@ -27,9 +57,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function renderProgress(current, total, label = "") {
   const percent = total > 0 ? ((current / total) * 100).toFixed(2) : "100.00";
   const barLength = 30;
-  const filled = total > 0 ? Math.round((barLength * current) / total) : barLength;
+  const filled =
+    total > 0 ? Math.round((barLength * current) / total) : barLength;
   const bar = "█".repeat(filled) + "-".repeat(barLength - filled);
-  process.stdout.write(`\r${label.padEnd(12)} [${bar}] ${percent}% (${current}/${total})`.padEnd(60));
+  process.stdout.write(
+    `\r${label.padEnd(12)} [${bar}] ${percent}% (${current}/${total})`.padEnd(
+      60,
+    ),
+  );
 }
 
 // ================= STATE & DATE =================
@@ -52,7 +87,9 @@ function saveState(state) {
   }
 }
 
-function toDate(str) { return new Date(str.replace(" ", "T")); }
+function toDate(str) {
+  return new Date(str.replace(" ", "T"));
+}
 
 // ================= API =================
 async function fetchPage(page, lastRun) {
@@ -62,10 +99,10 @@ async function fetchPage(page, lastRun) {
 }
 
 // ================= UMBRELLA =================
-async function sendBatchToUmbrella(domains) {
+async function sendBatchToUmbrella(domains, attempt = 0) {
   if (!ENABLE_UMBRELLA) return;
 
-  // Rate Limiting Enforcement
+  // 1. Kendi iç Rate Limiting Kontrolümüz (Soft Limit)
   if (Date.now() - lastReset > 60000) {
     domainsSentThisMinute = 0;
     lastReset = Date.now();
@@ -73,19 +110,21 @@ async function sendBatchToUmbrella(domains) {
 
   if (domainsSentThisMinute + domains.length > MAX_DOMAINS_PER_MIN) {
     const waitTime = 60000 - (Date.now() - lastReset);
+    console.log(`Soft limit reached, waiting ${Math.round(waitTime/1000)}s...`);
     await sleep(waitTime);
-    return sendBatchToUmbrella(domains);
+    return sendBatchToUmbrella(domains, attempt);
   }
 
+  // Event yapısını oluştur
   const events = domains.map((d) => ({
-    alertTime: new Date().toISOString().split('.')[0] + 'Z',
-    eventTime: new Date().toISOString().split('.')[0] + 'Z',
+    alertTime: new Date().toISOString().split(".")[0] + "Z",
+    eventTime: new Date().toISOString().split(".")[0] + "Z",
     deviceId: "siberguvenlik-sync-agent",
     deviceVersion: "1.0",
     dstDomain: d,
     dstUrl: `http://${d}/`,
     protocolVersion: "1.0a",
-    providerName: "Security Platform"
+    providerName: "Security Platform",
   }));
 
   try {
@@ -93,13 +132,26 @@ async function sendBatchToUmbrella(domains) {
       headers: { "Content-Type": "application/json" },
       timeout: 15000,
     });
+    
+    // Başarılı ise sayacı güncelle
     domainsSentThisMinute += domains.length;
   } catch (err) {
     if (err.response?.status === 429) {
-      await sleep(5000);
-      return sendBatchToUmbrella(domains);
+      const retryAfterHeader = err.response.headers['retry-after'];
+      
+      const delay = retryAfterHeader 
+        ? parseInt(retryAfterHeader) * 1000 
+        : Math.min(5000 * Math.pow(2, attempt), 60000);
+
+      console.warn(`[429] Rate limited. Retrying in ${Math.round(delay/1000)}s... (Attempt ${attempt + 1})`);
+      
+      await sleep(delay);
+      return sendBatchToUmbrella(domains, attempt + 1);
     }
-    throw err; // Allow main loop to handle severe errors
+    
+    // 429 dışındaki hataları fırlat
+    console.error(`[Error] Request failed with status ${err.response?.status}:`, err.message);
+    throw err;
   }
 }
 
@@ -111,6 +163,7 @@ async function run() {
   let allItems = [];
   const state = loadState();
 
+  // 1. FETCH PHASE
   if (skipFetch) {
     console.log("--- Loading from domains.txt ---");
     if (fs.existsSync(OUTPUT_FILE)) {
@@ -121,47 +174,56 @@ async function run() {
     }
   } else {
     console.log("--- Starting Fetch Phase ---");
-    for (let page = 0; page < TOTAL_PAGES; page++) {
+    const firstPageRes = await fetchPage(0, state.lastRun);
+    const totalPages = firstPageRes.data?.pageCount || 0;
+
+    console.log(`Detected ${totalPages} total pages to fetch.`);
+    allItems.push(...(firstPageRes.data?.models || []));
+    renderProgress(1, totalPages, "Fetching");
+
+    for (let page = 1; page < totalPages; page++) {
       const res = await fetchPage(page, state.lastRun);
-      const items = res.data?.models || [];
-      allItems.push(...items);
-      renderProgress(page + 1, TOTAL_PAGES, "Fetching");
+      allItems.push(...(res.data?.models || []));
+      renderProgress(page + 1, totalPages, "Fetching");
       await sleep(1200);
-    }
-    
-    // Save to file
-    const stream = fs.createWriteStream(OUTPUT_FILE, { flags: "a" });
-    allItems.forEach(item => stream.write(item.url + "\n"));
-    stream.end();
-    
-    // Update State IMMEDIATELY after fetch success
-    if (allItems.length > 0) {
-      const maxDate = allItems.reduce((max, item) => 
-        (toDate(item.date) > new Date(max || 0) ? item.date : max), state.lastRun);
-      saveState({ lastRun: maxDate });
-      console.log("\n--- Fetching Complete. State updated to:", maxDate, "---");
-    } else {
-      console.log("\n--- Fetching Complete. No new items found. ---");
     }
   }
 
   if (allItems.length === 0) {
-    console.log("No new items to process.");
+    console.log("\nNo new items to process.");
     return;
   }
 
-  // BATCH PHASE
-  console.log(`--- Starting Batch/Upload Phase (${allItems.length} items) ---`);
-  const chunkArray = (arr, size) => Array.from({ length: Math.ceil(arr.length / size) }, (_, i) => arr.slice(i * size, i * size + size));
-  const batches = chunkArray(allItems, BATCH_SIZE);
+  // 2. DEDUPLICATION & BATCH PREP
+  const existingDomains = loadDomains();
+  const uniqueNewDomains = [...new Set(allItems.map(item => item.url))];
+  const domainsToUpload = uniqueNewDomains.filter(d => !existingDomains.includes(d));
 
-  for (let i = 0; i < batches.length; i++) {
-    const domains = batches[i].map((x) => x.url);
-    await sendBatchToUmbrella(domains);
-    renderProgress(i + 1, batches.length, "Uploading");
+  // 3. UPLOAD PHASE (Atomic)
+  console.log(`\n--- Starting Batch/Upload Phase (${domainsToUpload.length} new items) ---`);
+  
+  try {
+    const chunkArray = (arr, size) => Array.from({ length: Math.ceil(arr.length / size) }, (_, i) => arr.slice(i * size, i * size + size));
+    const batches = chunkArray(domainsToUpload, BATCH_SIZE);
+
+    for (let i = 0; i < batches.length; i++) {
+      await sendBatchToUmbrella(batches[i]);
+      renderProgress(i + 1, batches.length, "Uploading");
+    }
+
+    // UPDATE STATE ONLY AFTER SUCCESSFUL UPLOAD
+    const maxDate = allItems.reduce((max, item) => 
+      (toDate(item.date) > new Date(max || 0) ? item.date : max), state.lastRun);
+    
+    // Save updated domains list and state
+    saveDomains([...existingDomains, ...domainsToUpload]);
+    saveState({ lastRun: maxDate });
+    
+    console.log("\n--- Success! State updated to:", maxDate, "---");
+  } catch (err) {
+    console.error("\n!!! CRITICAL ERROR during Upload. State NOT updated to prevent data loss. !!!");
+    throw err; // Re-throw to let the process exit with failure
   }
-
-  console.log("\nDONE.");
 }
 
 run().catch(console.error);
